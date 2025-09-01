@@ -26,7 +26,7 @@ jobs:
   prepare:
     name: "Prepare release"
     runs-on: ubuntu-latest
-    if: github.repository == 'github/codeql-action'
+    if: github.repository == 'dsp-testing/mbg-codeql-action-test'
 
     permissions:
       contents: read

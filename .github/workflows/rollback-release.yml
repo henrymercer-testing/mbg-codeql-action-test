@@ -17,7 +17,7 @@ on:
 jobs:
   prepare:
     name: "Prepare release"
-    if: github.repository == 'github/codeql-action'
+    if: github.repository == 'dsp-testing/mbg-codeql-action-test'
 
     permissions:
       contents: read
@@ -26,7 +26,7 @@ jobs:
 
   rollback:
     name: "Create rollback release"
-    if: github.repository == 'github/codeql-action'
+    if: github.repository == 'dsp-testing/mbg-codeql-action-test'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
