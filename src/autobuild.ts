@@ -1,58 +1,171 @@
-import * as core from '@actions/core';
-import * as exec from '@actions/exec';
-import * as path from 'path';
+import * as core from "@actions/core";
 
-import * as sharedEnv from './shared-environment';
-import * as util from './util';
+import { getTemporaryDirectory, getWorkflowEventName } from "./actions-util";
+import { getGitHubVersion } from "./api-client";
+import { CodeQL, getCodeQL } from "./codeql";
+import * as configUtils from "./config-utils";
+import { DocUrl } from "./doc-url";
+import { EnvVar } from "./environment";
+import { Feature, featureConfig, Features } from "./feature-flags";
+import { KnownLanguage, Language } from "./languages";
+import { Logger } from "./logging";
+import { getRepositoryNwo } from "./repository";
+import { asyncFilter, BuildMode } from "./util";
 
-async function run() {
-  try {
-    if (util.should_abort('autobuild', true) || !await util.reportActionStarting('autobuild')) {
-      return;
-    }
-
-    // Attempt to find a language to autobuild
-    // We want pick the dominant language in the repo from the ones we're able to build
-    // The languages are sorted in order specified by user or by lines of code if we got
-    // them from the GitHub API, so try to build the first language on the list.
-    const language = process.env[sharedEnv.CODEQL_ACTION_TRACED_LANGUAGES]?.split(',')[0];
-
-    if (!language) {
-      core.info("None of the languages in this project require extra build steps");
-      return;
-    }
-
-    core.debug(`Detected dominant traced language: ${language}`);
-
-    core.startGroup(`Attempting to automatically build ${language} code`);
-    // TODO: share config accross actions better via env variables
-    const codeqlCmd = util.getRequiredEnvParam(sharedEnv.CODEQL_ACTION_CMD);
-
-    const cmdName = process.platform === 'win32' ? 'autobuild.cmd' : 'autobuild.sh';
-    const autobuildCmd = path.join(path.dirname(codeqlCmd), language, 'tools', cmdName);
-
-
-    // Update JAVA_TOOL_OPTIONS to contain '-Dhttp.keepAlive=false'
-    // This is because of an issue with Azure pipelines timing out connections after 4 minutes
-    // and Maven not properly handling closed connections
-    // Otherwise long build processes will timeout when pulling down Java packages
-    // https://developercommunity.visualstudio.com/content/problem/292284/maven-hosted-agent-connection-timeout.html
-    let javaToolOptions = process.env['JAVA_TOOL_OPTIONS'] || "";
-    process.env['JAVA_TOOL_OPTIONS'] = [...javaToolOptions.split(/\s+/), '-Dhttp.keepAlive=false', '-Dmaven.wagon.http.pool=false'].join(' ');
-
-    await exec.exec(autobuildCmd);
-    core.endGroup();
-
-  } catch (error) {
-    core.setFailed(error.message);
-    await util.reportActionFailed('autobuild', error.message, error.stack);
-    return;
+export async function determineAutobuildLanguages(
+  codeql: CodeQL,
+  config: configUtils.Config,
+  logger: Logger,
+): Promise<Language[] | undefined> {
+  if (
+    config.buildMode === BuildMode.None ||
+    config.buildMode === BuildMode.Manual
+  ) {
+    logger.info(
+      `Using build mode "${config.buildMode}", nothing to autobuild. ` +
+        `See ${DocUrl.CODEQL_BUILD_MODES} for more information.`,
+    );
+    return undefined;
   }
 
-  await util.reportActionSucceeded('autobuild');
+  // Attempt to find a language to autobuild
+  // We want pick the dominant language in the repo from the ones we're able to build
+  // The languages are sorted in order specified by user or by lines of code if we got
+  // them from the GitHub API, so try to build the first language on the list.
+  const autobuildLanguages = await asyncFilter(
+    config.languages,
+    async (language) => await codeql.isTracedLanguage(language),
+  );
+
+  if (autobuildLanguages.length === 0) {
+    logger.info(
+      "None of the languages in this project require extra build steps",
+    );
+    return undefined;
+  }
+
+  /**
+   * Additionally autobuild Go in the autobuild Action to ensure backwards
+   * compatibility for users performing a multi-language build within a single
+   * job.
+   *
+   * For example, consider a user with the following workflow file:
+   *
+   * ```yml
+   * - uses: github/codeql-action/init@v3
+   *   with:
+   *     languages: go, java
+   * - uses: github/codeql-action/autobuild@v3
+   * - uses: github/codeql-action/analyze@v3
+   * ```
+   *
+   * - With Go extraction disabled, we will run the Java autobuilder in the
+   *   autobuild Action, ensuring we extract both Java and Go code.
+   * - With Go extraction enabled, taking the previous behavior we'd run the Go
+   *   autobuilder, since Go is first on the list of languages. We wouldn't run
+   *   the Java autobuilder at all and so we'd only extract Go code.
+   *
+   * We therefore introduce a special case here such that we'll autobuild Go
+   * in addition to the primary non-Go traced language in the autobuild Action.
+   *
+   * This special case behavior should be removed as part of the next major
+   * version of the CodeQL Action.
+   */
+  const autobuildLanguagesWithoutGo = autobuildLanguages.filter(
+    (l) => l !== KnownLanguage.go,
+  );
+
+  const languages: Language[] = [];
+  // First run the autobuilder for the first non-Go traced language, if one
+  // exists.
+  if (autobuildLanguagesWithoutGo[0] !== undefined) {
+    languages.push(autobuildLanguagesWithoutGo[0]);
+  }
+  // If Go is requested, run the Go autobuilder last to ensure it doesn't
+  // interfere with the other autobuilder.
+  if (autobuildLanguages.length !== autobuildLanguagesWithoutGo.length) {
+    languages.push(KnownLanguage.go);
+  }
+
+  logger.debug(`Will autobuild ${languages.join(" and ")}.`);
+
+  // In general the autobuilders for other traced languages may conflict with
+  // each other. Therefore if a user has requested more than one non-Go traced
+  // language, we ask for manual build steps.
+  // Matrixing the build would also work, but that would change the SARIF
+  // categories, potentially leading to a "stale tips" situation where alerts
+  // that should be fixed remain on a repo since they are linked to SARIF
+  // categories that are no longer updated.
+  if (autobuildLanguagesWithoutGo.length > 1) {
+    logger.warning(
+      `We will only automatically build ${languages.join(
+        " and ",
+      )} code. If you wish to scan ${autobuildLanguagesWithoutGo
+        .slice(1)
+        .join(
+          " and ",
+        )}, you must replace the autobuild step of your workflow with custom build steps. ` +
+        `See ${DocUrl.SPECIFY_BUILD_STEPS_MANUALLY} for more information.`,
+    );
+  }
+
+  return languages;
 }
 
-run().catch(e => {
-  core.setFailed("autobuild action failed: " + e);
-  console.log(e);
-});
+export async function setupCppAutobuild(codeql: CodeQL, logger: Logger) {
+  const envVar = featureConfig[Feature.CppDependencyInstallation].envVar;
+  const featureName = "C++ automatic installation of dependencies";
+  const gitHubVersion = await getGitHubVersion();
+  const repositoryNwo = getRepositoryNwo();
+  const features = new Features(
+    gitHubVersion,
+    repositoryNwo,
+    getTemporaryDirectory(),
+    logger,
+  );
+  if (await features.getValue(Feature.CppDependencyInstallation, codeql)) {
+    // disable autoinstall on self-hosted runners unless explicitly requested
+    if (
+      process.env["RUNNER_ENVIRONMENT"] === "self-hosted" &&
+      process.env[envVar] !== "true"
+    ) {
+      logger.info(
+        `Disabling ${featureName} as we are on a self-hosted runner.${
+          getWorkflowEventName() !== "dynamic"
+            ? ` To override this, set the ${envVar} environment variable to 'true' in your workflow. See ${DocUrl.DEFINE_ENV_VARIABLES} for more information.`
+            : ""
+        }`,
+      );
+      core.exportVariable(envVar, "false");
+    } else {
+      logger.info(
+        `Enabling ${featureName}. This can be disabled by setting the ${envVar} environment variable to 'false'. See ${DocUrl.DEFINE_ENV_VARIABLES} for more information.`,
+      );
+      core.exportVariable(envVar, "true");
+    }
+  } else {
+    logger.info(`Disabling ${featureName}.`);
+    core.exportVariable(envVar, "false");
+  }
+}
+
+export async function runAutobuild(
+  config: configUtils.Config,
+  language: Language,
+  logger: Logger,
+) {
+  logger.startGroup(`Attempting to automatically build ${language} code`);
+  const codeQL = await getCodeQL(config.codeQLCmd);
+  if (language === KnownLanguage.cpp) {
+    await setupCppAutobuild(codeQL, logger);
+  }
+  if (config.buildMode) {
+    await codeQL.extractUsingBuildMode(config, language);
+  } else {
+    await codeQL.runAutobuild(config, language);
+  }
+  if (language === KnownLanguage.go) {
+    core.exportVariable(EnvVar.DID_AUTOBUILD_GOLANG, "true");
+  }
+  logger.endGroup();
+}

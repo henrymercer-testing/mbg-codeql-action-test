@@ -1,0 +1,21 @@
+name: "Go: Custom queries"
+description: "Checks that Go works in conjunction with a config file specifying custom queries"
+collection: go
+operatingSystems:
+  - ubuntu
+versions:
+  - linked
+  - nightly-latest
+installGo: true
+env:
+  DOTNET_GENERATE_ASPNET_CERTIFICATE: "false"
+steps:
+  - uses: ./../action/init
+    with:
+      languages: go
+      config-file: ./.github/codeql/custom-queries.yml
+      tools: ${{ steps.prepare-test.outputs.tools-url }}
+  - name: Build code
+    shell: bash
+    run: ./build.sh
+  - uses: ./../action/analyze
