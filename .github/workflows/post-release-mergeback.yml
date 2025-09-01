@@ -22,7 +22,7 @@ jobs:
   merge-back:
     runs-on: ubuntu-latest
     environment: Automation
-    if: github.repository == 'dsp-testing/mbg-codeql-action-test'
+    if: github.repository == 'henrymercer-testing/mbg-codeql-action-test'
     env:
       BASE_BRANCH: "${{ github.event.inputs.baseBranch || 'main' }}"
       HEAD_BRANCH: "${{ github.head_ref || github.ref }}"

@@ -27,7 +27,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          gh pr edit --repo dsp-testing/mbg-codeql-action-test "$PR_NUMBER" \
+          gh pr edit --repo henrymercer-testing/mbg-codeql-action-test "$PR_NUMBER" \
             --remove-label "Rebuild"
 
       - name: Configure git
