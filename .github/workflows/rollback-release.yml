@@ -40,6 +40,7 @@ jobs:
 
     permissions:
       contents: write # needed to push to the repo (tags and releases)
+      pull-requests: write # needed to create PRs
 
     steps:
       - name: Checkout repository
